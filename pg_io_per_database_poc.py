@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Proof-of-concept: attribute Aurora PostgreSQL *billed* volume I/O to individual
-logical databases.
+logical databases -- via the RDS Data API (no VPC/psql access required).
 
 Why this exists
 ---------------
@@ -23,9 +23,15 @@ are not cleanly attributable to a single database). The point of this PoC is to
 let you eyeball how well the split tracks the real cluster total before building
 it into the pricing tool.
 
-Requires: python3 -m pip install boto3 psycopg2-binary rich
+Transport: this version talks to the cluster through the RDS Data API
+(rds-data execute-statement), so it runs from anywhere with IAM creds and needs
+no direct network path to the DB. The cluster must have the Data API enabled
+(HttpEndpointEnabled) and a Secrets Manager secret holding the master creds.
+
+Requires: python3 -m pip install boto3
 """
 
+import re
 import sys
 import time
 import argparse
@@ -33,9 +39,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 import boto3
-import psycopg2
-from rich.console import Console
-from rich.table import Table
+from botocore.exceptions import ClientError
 
 
 # Databases that are engine plumbing, not user workloads. Shown but flagged.
@@ -45,58 +49,73 @@ SYSTEM_DATABASES = {"template0", "template1", "rdsadmin", "postgres"}
 class PgIoAttributionPoC:
     def __init__(self, args):
         self._args = args
-        self._console = Console()
         session = boto3.Session(profile_name=args.profile)
         self._cloudwatch = session.client("cloudwatch", region_name=args.region)
+        self._rds_data = session.client("rds-data", region_name=args.region)
 
-    # --- engine sampling -------------------------------------------------
+    # --- engine sampling via Data API ------------------------------------
 
-    def _connect(self):
-        return psycopg2.connect(
-            host=self._args.host,
-            port=self._args.port,
-            dbname=self._args.connect_db,
-            user=self._args.user,
-            password=self._args.password,
-            connect_timeout=10,
-            # ponytail: read-only intent; we never write. sslmode=require is the
-            # sane default for Aurora endpoints.
-            sslmode="require",
-        )
+    def _execute(self, sql):
+        """Run one SQL statement through the Data API, with auto-pause warm-up.
 
-    def _sample(self, conn):
+        Serverless v2 can be scaled to zero; the first call then returns
+        DatabaseResumingException while the instance wakes. Retry briefly.
+        """
+        deadline = time.time() + 90
+        while True:
+            try:
+                return self._rds_data.execute_statement(
+                    resourceArn=self._args.cluster_arn,
+                    secretArn=self._args.secret_arn,
+                    database=self._args.connect_db,
+                    sql=sql,
+                )
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                msg = str(e)
+                resuming = code == "DatabaseResumingException" or "resuming" in msg
+                if resuming and time.time() < deadline:
+                    print("  cluster resuming from auto-pause, waiting...", file=sys.stderr)
+                    time.sleep(5)
+                    continue
+                raise
+
+    def _sample(self):
         """One snapshot of per-database physical I/O counters.
 
         blks_read  = blocks read from storage (physical reads -> read I/O proxy)
         tup_*      = rows written; summed as a coarse write-activity proxy since
                      pg_stat_database has no direct 'blocks written' column.
         """
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT datname,
-                       blks_read,
-                       COALESCE(tup_inserted, 0)
-                     + COALESCE(tup_updated, 0)
-                     + COALESCE(tup_deleted, 0) AS write_rows
-                FROM pg_stat_database
-                WHERE datname IS NOT NULL
-                """
-            )
-            return {row[0]: {"reads": row[1], "writes": row[2]} for row in cur.fetchall()}
+        resp = self._execute(
+            """
+            SELECT datname,
+                   blks_read,
+                   COALESCE(tup_inserted, 0)
+                 + COALESCE(tup_updated, 0)
+                 + COALESCE(tup_deleted, 0) AS write_rows
+            FROM pg_stat_database
+            WHERE datname IS NOT NULL
+            """
+        )
+        out = {}
+        for row in resp["records"]:
+            # row = [ {stringValue: name}, {longValue: reads}, {longValue: writes} ]
+            name = row[0].get("stringValue")
+            reads = _long(row[1])
+            writes = _long(row[2])
+            if name is not None:
+                out[name] = {"reads": reads, "writes": writes}
+        return out
 
     def sample_rates(self):
         """Take two samples `interval` seconds apart, return per-db deltas."""
-        conn = self._connect()
-        try:
-            self._console.print(
-                f"Sampling pg_stat_database, {self._args.interval}s apart...", style="bold"
-            )
-            first = self._sample(conn)
-            time.sleep(self._args.interval)
-            second = self._sample(conn)
-        finally:
-            conn.close()
+        print(
+            f"Sampling pg_stat_database via Data API, {self._args.interval}s apart..."
+        )
+        first = self._sample()
+        time.sleep(self._args.interval)
+        second = self._sample()
 
         deltas = {}
         for db, after in second.items():
@@ -155,75 +174,134 @@ class PgIoAttributionPoC:
         total_logical_reads = sum(d["reads"] for d in deltas.values()) or 1
         total_logical_writes = sum(d["writes"] for d in deltas.values()) or 1
 
-        table = Table(title="Per-database I/O attribution (estimate)", show_lines=True)
-        for col in [
+        headers = [
             "Database",
             "Logical reads",
             "Read share",
             "Est. billed reads",
             "Logical writes",
             "Write share",
-        ]:
-            table.add_column(col)
-
+        ]
+        rows = []
         for db in sorted(deltas, key=lambda d: deltas[d]["reads"], reverse=True):
             d = deltas[db]
             read_share = d["reads"] / total_logical_reads
             write_share = d["writes"] / total_logical_writes
             est_billed_reads = Decimal(str(billed["reads"])) * Decimal(str(read_share))
-            label = f"{db} [dim](system)[/dim]" if db in SYSTEM_DATABASES else db
-            table.add_row(
+            label = f"{db} (system)" if db in SYSTEM_DATABASES else db
+            rows.append([
                 label,
                 f"{d['reads']:,}",
                 f"{read_share * 100:.1f}%",
                 f"{est_billed_reads:,.0f}",
                 f"{d['writes']:,}",
                 f"{write_share * 100:.1f}%",
-            )
-        self._console.print(table)
+            ])
 
-        self._console.print(
-            f"\nCluster billed I/O over window (CloudWatch, authoritative):",
-            style="bold",
-        )
-        self._console.print(f"- VolumeReadIOPs (sum):  {billed['reads']:,.0f}")
-        self._console.print(f"- VolumeWriteIOPs (sum): {billed['writes']:,.0f}")
+        print("\nPer-database I/O attribution (estimate)")
+        _print_table(headers, rows)
+
+        print("\nCluster billed I/O over window (CloudWatch, authoritative):")
+        print(f"- VolumeReadIOPs (sum):  {billed['reads']:,.0f}")
+        print(f"- VolumeWriteIOPs (sum): {billed['writes']:,.0f}")
 
         # The honesty check: does the logical read total look proportional to
         # the billed read total? A wildly different magnitude means the proxy
         # is weak for this workload.
-        self._console.print(
-            "\n[bold]Sanity check[/bold] -- logical reads captured across all DBs: "
+        print(
+            f"\nSanity check -- logical reads captured across all DBs: "
             f"{total_logical_reads:,}. Compare the *shares* above against your "
             "knowledge of the workload; the per-DB billed numbers are the "
-            "cluster total split by those shares, [italic]not[/italic] measured "
-            "directly."
+            "cluster total split by those shares, not measured directly."
         )
-        self._console.print(
-            "[yellow]Reminder:[/yellow] writes have no clean block-level counter "
-            "in pg_stat_database, so write shares use row activity as a coarse "
+        print(
+            "Reminder: writes have no clean block-level counter in "
+            "pg_stat_database, so write shares use row activity as a coarse "
             "proxy and are less reliable than read shares."
         )
 
 
+def _print_table(headers, rows):
+    """Minimal fixed-width table. Numeric-looking cells right-align.
+
+    ponytail: replaces rich just to render one table; stdlib str formatting
+    is plenty. Ceiling: no wrapping/colour. Upgrade path: reinstate rich if
+    output ever needs styling.
+    """
+    cols = list(zip(*([headers] + rows))) if rows else [[h] for h in headers]
+    widths = [max(len(str(c)) for c in col) for col in cols]
+
+    def fmt(cells):
+        out = []
+        for i, cell in enumerate(cells):
+            s = str(cell)
+            # Right-align cells that look like numbers/percentages/counts.
+            right = bool(re.fullmatch(r"[\d,.\s%-]+", s))
+            out.append(s.rjust(widths[i]) if right else s.ljust(widths[i]))
+        return "  ".join(out)
+
+    sep = "  ".join("-" * w for w in widths)
+    print(fmt(headers))
+    print(sep)
+    for row in rows:
+        print(fmt(row))
+
+
+def _long(field):
+    """Pull an integer out of a Data API field, tolerating type variance."""
+    if field.get("isNull"):
+        return 0
+    if "longValue" in field:
+        return field["longValue"]
+    if "stringValue" in field:
+        return int(field["stringValue"])
+    if "doubleValue" in field:
+        return int(field["doubleValue"])
+    return 0
+
+
+def _cluster_id_from_arn(arn):
+    """arn:aws:rds:region:acct:cluster:my-cluster -> my-cluster."""
+    m = re.match(r"arn:aws[^:]*:rds:[^:]*:[^:]*:cluster:(.+)$", arn)
+    return m.group(1) if m else None
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--region", required=True, help="AWS region (e.g. eu-west-1)")
-    p.add_argument("--cluster", required=True, help="Aurora cluster identifier (for CloudWatch)")
-    p.add_argument("--host", required=True, help="Cluster/writer endpoint hostname")
-    p.add_argument("--port", default=5432, type=int)
-    p.add_argument("--user", required=True, help="DB user with CONNECT + pg_stat access")
-    p.add_argument("--password", required=True, help="DB password")
-    p.add_argument("--connect-db", default="postgres", help="Database to connect to for stats")
+    p.add_argument("--region", required=True, help="AWS region (e.g. us-east-1)")
+    p.add_argument(
+        "--cluster-arn",
+        required=True,
+        help="Aurora cluster ARN (Data API resourceArn)",
+    )
+    p.add_argument(
+        "--secret-arn",
+        required=True,
+        help="Secrets Manager ARN with the DB master credentials",
+    )
+    p.add_argument(
+        "--cluster",
+        help="Cluster identifier for CloudWatch (defaults to the name in --cluster-arn)",
+    )
+    p.add_argument(
+        "--connect-db",
+        default="postgres",
+        help="Database to run the pg_stat query against (default: postgres)",
+    )
     p.add_argument("--interval", default=60, type=int, help="Seconds between samples (default 60)")
     p.add_argument("--profile", help="AWS profile name")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.cluster:
+        args.cluster = _cluster_id_from_arn(args.cluster_arn)
+        if not args.cluster:
+            p.error("could not derive --cluster from --cluster-arn; pass --cluster explicitly")
+    return args
 
 
 if __name__ == "__main__":
     args = parse_args()
     try:
         PgIoAttributionPoC(args).run()
-    except psycopg2.Error as e:
-        print(f"Database error: {e}", file=sys.stderr)
+    except ClientError as e:
+        print(f"AWS error: {e}", file=sys.stderr)
         sys.exit(1)

@@ -12,12 +12,19 @@ Proof-of-concept (Aurora PostgreSQL only). Samples `pg_stat_database` to get
 per-database logical I/O rates, then splits the cluster's real billed I/O
 (from CloudWatch) proportionally across databases.
 
+Talks to the cluster through the **RDS Data API**, so it runs from anywhere with
+IAM creds — no VPC access or `psql`/`psycopg2` needed. The cluster must have the
+Data API enabled and a Secrets Manager secret with the master credentials.
+
 ```
-python3 -m pip install boto3 psycopg2-binary rich
-python3 pg_io_per_database_poc.py --region eu-west-1 --cluster my-cluster \
-    --host my-cluster.cluster-xxxx.eu-west-1.rds.amazonaws.com \
-    --user reporting --password '***'
+python3 -m pip install boto3
+python3 pg_io_per_database_poc.py --region us-east-1 \
+    --cluster-arn arn:aws:rds:us-east-1:ACCT:cluster:my-cluster \
+    --secret-arn arn:aws:secretsmanager:us-east-1:ACCT:secret:my-db-secret
 ```
+
+`--cluster` (the CloudWatch identifier) is derived from `--cluster-arn`
+automatically; pass it explicitly only if they differ.
 
 Read attribution (`blks_read`) is reliable; write attribution is a coarse
 row-activity proxy. See the module docstring for the full caveats.
