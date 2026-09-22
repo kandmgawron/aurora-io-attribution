@@ -417,18 +417,17 @@ class CostAdvisor:
 
         pricing = self.build_pricing()
 
+        warnings = []
+
         # Cluster billed I/O over the sampling window (with lag fallback).
         billed_window, fell_back, age_min = self.billed_io(
             start - timedelta(minutes=5), end + timedelta(minutes=5)
         )
         if fell_back:
-            note = f" (nearest bucket ~{age_min:.0f} min old)" if age_min is not None else ""
-            print(
-                f"\nNote: no billed I/O datapoints inside the sampling window; "
-                f"fell back to the most recent available 5-min bucket{note}. "
-                "Billed-I/O figures are approximate. For accurate figures, run "
-                "against a cluster with recent sustained traffic and re-run with "
-                "a longer --interval.", file=sys.stderr,
+            age = f"~{age_min:.0f} min old" if age_min is not None else "stale"
+            warnings.append(
+                f"Billed I/O: no datapoints in window; used nearest 5-min bucket ({age}). "
+                "Figures approximate -- run against sustained traffic for accuracy."
             )
 
         # Extrapolate billed I/O to a month.
@@ -445,10 +444,9 @@ class CostAdvisor:
         shares = io_shares(deltas)
         total_io = sum(d["reads"] + d["writes"] for d in deltas.values())
         if total_io == 0:
-            print(
-                "\nNo logical I/O observed during the sampling window. The cluster "
-                "looks idle -- run against live traffic or use a longer --interval.",
-                file=sys.stderr,
+            warnings.append(
+                "No logical I/O observed -- cluster looks idle. Run against live "
+                "traffic or use a longer --interval."
             )
 
         # Part 1: raw per-database I/O attribution (the estimate + evidence).
@@ -457,14 +455,17 @@ class CostAdvisor:
         self._report(deltas, shares, sizes, billed_month, acu_hours_month,
                      pricing, provisioned, window)
 
+        if warnings:
+            print("\n--- Warnings ---")
+            for w in warnings:
+                print(f"  ! {w}")
+
     def _attribution_report(self, deltas, shares, billed_window, fell_back):
         """Per-database I/O attribution: how the cluster's billed I/O splits
         across logical databases (the foundation the pricing rests on)."""
         include_system = self._args.include_system
         dbs = [d for d in deltas if include_system or d not in SYSTEM_DATABASES]
         dbs.sort(key=lambda d: deltas[d]["reads"], reverse=True)
-
-        total_logical_reads = sum(d["reads"] for d in deltas.values()) or 1
 
         headers = ["Database", "Logical reads", "Read share", "Est. billed reads",
                    "Logical writes", "Write share"]
@@ -483,19 +484,12 @@ class CostAdvisor:
                 f"{sh['write_share']*100:.1f}%",
             ])
 
-        print("\n=== Per-database I/O attribution (estimate) ===")
+        print("\n=== PART 1: PER-DATABASE I/O ATTRIBUTION ===")
         _print_table(headers, rows)
-        auth = " (approximate -- see billed-I/O note above)" if fell_back else ""
-        print(f"\nCluster billed I/O over window (CloudWatch, authoritative{auth}):")
-        print(f"- VolumeReadIOPs (sum):  {billed_window['reads']:,.0f}")
-        print(f"- VolumeWriteIOPs (sum): {billed_window['writes']:,.0f}")
-        print(
-            f"\nSanity check -- logical reads captured across all DBs: "
-            f"{total_logical_reads:,}. The per-DB billed numbers are the cluster "
-            "total split by each DB's share, not measured directly. Read shares "
-            "(blks_read) are reliable; write shares use row activity as a coarse "
-            "proxy (pg_stat_database has no block-level write counter)."
-        )
+        auth = "approximate" if fell_back else "authoritative"
+        print(f"\nCluster billed I/O over window (CloudWatch, {auth}):")
+        print(f"  VolumeReadIOPs   {billed_window['reads']:>14,.0f}")
+        print(f"  VolumeWriteIOPs  {billed_window['writes']:>14,.0f}")
 
     def _report(self, deltas, shares, sizes, billed_month, acu_hours_month,
                 pricing, provisioned, window):
@@ -531,39 +525,40 @@ class CostAdvisor:
                 f"{pct:.1f}%",
             ])
 
-        print(f"\nSampling window: {window:.0f}s (extrapolated to a 730h month)")
-        print("\n=== Per-database Standard vs I/O-Optimized cost recommendation ===")
-        print("(each database priced as if alone on a cluster)")
+        print(f"\n=== PART 2: STANDARD vs I/O-OPTIMIZED COST (per DB, priced as if alone) ===")
         _print_table(headers, rows)
 
         # Cluster-level recommendation.
         c_cheaper, c_pct = verdict(cluster_std, cluster_opt)
-        print("\nCluster totals (sum of per-DB estimates):")
-        print(f"  Aurora Standard:      ${cluster_std:,.2f}/mo")
-        print(f"  Aurora I/O-Optimized: ${cluster_opt:,.2f}/mo")
-        print(f"  --> If kept as one cluster, {c_cheaper} is cheaper by {c_pct:.1f}%.")
+        print("\nCluster totals:")
+        print(f"  Standard        ${cluster_std:>10,.2f}/mo")
+        print(f"  I/O-Optimized   ${cluster_opt:>10,.2f}/mo")
+        print(f"  Single-cluster verdict: {c_cheaper} (cheaper by {c_pct:.1f}%)")
 
         # Split recommendation.
         opt_dbs = [r[0] for r in rows if r[6] == "I/O-Optimized"]
         std_dbs = [r[0] for r in rows if r[6] == "Standard"]
-        print("\nCluster-split guidance:")
+        print("\nCluster-split recommendation:")
         if opt_dbs and std_dbs:
-            print(f"  I/O-Optimized candidates: {', '.join(opt_dbs)}")
-            print(f"  Standard candidates:      {', '.join(std_dbs)}")
-            print("  Splitting these into two clusters by the grouping above can beat "
-                  "a single-mode cluster when the workloads are mixed.")
+            print(f"  -> I/O-Optimized cluster: {', '.join(opt_dbs)}")
+            print(f"  -> Standard cluster:      {', '.join(std_dbs)}")
         elif opt_dbs:
-            print(f"  All databases favour I/O-Optimized: {', '.join(opt_dbs)}")
+            print(f"  -> All on I/O-Optimized: {', '.join(opt_dbs)}")
         else:
-            print(f"  All databases favour Standard: {', '.join(std_dbs)}")
+            print(f"  -> All on Standard: {', '.join(std_dbs)}")
 
+        # Compact method / caveat footer: how, what, why -- one line each.
+        print("\n--- Method ---")
+        print(f"  Window:   {window:.0f}s sample, extrapolated to a 730h month.")
+        print("  What:     billed I/O split per DB by pg_stat_database activity share;")
+        print("            storage by pg_database_size; ServerlessV2 ACU by I/O share.")
+        print("  Why:      I/O-Optimized zeroes per-request I/O charges but raises")
+        print("            storage 2.25x and compute 1.33x -> wins only for I/O-heavy DBs.")
+        print("  Accuracy: read shares (blks_read) exact; write shares are a row-activity")
+        print("            proxy; per-DB compute is indicative. Validate before migrating.")
         if provisioned:
-            print(f"\nNote: provisioned instances present ({', '.join(provisioned)}); "
-                  "their compute is a fixed cluster cost not attributable per DB.")
-        print("\nReminder: per-DB billed I/O and compute are ESTIMATES derived from "
-              "logical activity shares. Read shares are reliable; write shares use "
-              "row activity as a proxy. Use the verdict to guide cluster grouping, "
-              "then validate with a billing-console what-if before migrating.")
+            print(f"  Note:     provisioned instances present ({', '.join(provisioned)}); "
+                  "their compute is a fixed cluster cost, not per-DB.")
 
 
 # =========================================================================
