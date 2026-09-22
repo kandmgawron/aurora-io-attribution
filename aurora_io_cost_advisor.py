@@ -133,6 +133,19 @@ def scale_to_month(value_in_window, window_seconds):
     return Decimal(str(value_in_window)) * (seconds_per_month / Decimal(str(window_seconds)))
 
 
+def normalize_period_to_month(value_over_period, period_hours):
+    """Normalise a REAL total measured over `period_hours` to a 730-hour month.
+
+    Unlike scale_to_month (which extrapolates a tiny 60s sample), this takes an
+    actual multi-day CloudWatch total and rescales it to a canonical month so
+    the $/mo figures are comparable. With a 30-day (720h) period the factor is
+    ~730/720 ~= 1.014 -- essentially the real total, not an extrapolation.
+    """
+    if period_hours <= 0:
+        return Decimal(0)
+    return Decimal(str(value_over_period)) * (HOURS_PER_MONTH / Decimal(str(period_hours)))
+
+
 def price_database(db_share, billed_io_month, storage_gb, acu_hours_month, pricing):
     """Cost of one database as if alone on a cluster, both storage modes.
 
@@ -309,56 +322,64 @@ class CostAdvisor:
         pts = sorted(r["Datapoints"], key=lambda d: d["Timestamp"])
         return pts
 
-    def billed_io(self, start, end):
-        """Billed I/O over [start,end]. Falls back to the most recent available
-        5-min buckets if the window itself has no datapoints (Serverless v2
-        publishes Volume* metrics on a lag and not at all while auto-paused)."""
+    def _period_bounds(self):
+        """Trailing-period [start, end] and its length in hours."""
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=self._args.period_days)
+        return start, end, Decimal(str(self._args.period_days)) * 24
+
+    @staticmethod
+    def _safe_period_seconds(period_days):
+        """CloudWatch caps a call at 1440 datapoints. Pick the finest period
+        (multiple of 60s) that keeps the count under the cap for the span."""
+        span_seconds = period_days * 24 * 3600
+        p = 3600  # hourly is plenty for billing aggregation
+        while span_seconds / p > 1440:
+            p *= 2
+        return p
+
+    def billed_io_period(self, start, end):
+        """REAL billed I/O summed over the trailing period (no extrapolation).
+
+        Returns totals and a flag if the period had no datapoints at all
+        (fully auto-paused / brand-new cluster)."""
         dims = [{"Name": "DBClusterIdentifier", "Value": self._args.cluster}]
+        period = self._safe_period_seconds(self._args.period_days)
 
-        def sum_metric(metric):
-            pts = self._metric_sum(metric, dims, start, end)
-            if pts:
-                return sum(p["Sum"] for p in pts), False, None
-            # Fallback: widen lookback to catch the freshest lagged bucket.
-            look_start = end - timedelta(hours=self._args.lookback_hours)
-            pts = self._metric_sum(metric, dims, look_start, end)
-            if not pts:
-                return 0.0, True, None
-            latest = pts[-1]
-            age_min = (datetime.now(timezone.utc) - latest["Timestamp"]).total_seconds() / 60
-            # Represent the window as one 5-min bucket's worth (rate proxy).
-            return latest["Sum"], True, age_min
+        def total(metric):
+            pts = self._metric_sum(metric, dims, start, end, period=period)
+            return sum(p["Sum"] for p in pts), len(pts)
 
-        reads, r_fb, r_age = sum_metric("VolumeReadIOPs")
-        writes, w_fb, w_age = sum_metric("VolumeWriteIOPs")
-        fell_back = r_fb or w_fb
-        age = max([a for a in (r_age, w_age) if a is not None], default=None)
-        return {"reads": reads, "writes": writes}, fell_back, age
+        reads, n_r = total("VolumeReadIOPs")
+        writes, n_w = total("VolumeWriteIOPs")
+        no_data = (n_r + n_w) == 0
+        return {"reads": reads, "writes": writes}, no_data
 
-    def stored_bytes(self, start, end):
+    def stored_gb_period(self, start, end):
+        """Average stored GB over the trailing period (real average)."""
         dims = [{"Name": "DBClusterIdentifier", "Value": self._args.cluster}]
-        pts = self._metric_avg_latest("VolumeBytesUsed", dims, start, end)
+        period = self._safe_period_seconds(self._args.period_days)
+        pts = self._metric_avg_latest("VolumeBytesUsed", dims, start, end, period=period)
         if not pts:
-            look_start = end - timedelta(hours=self._args.lookback_hours)
-            pts = self._metric_avg_latest("VolumeBytesUsed", dims, look_start, end)
-        return Decimal(str(pts[-1]["Average"])) if pts else Decimal(0)
+            return Decimal(0)
+        avg_bytes = sum(p["Average"] for p in pts) / len(pts)
+        return Decimal(str(avg_bytes)) / Decimal(1024**3)
 
-    def acu_hours(self, instances, start, end, window_seconds):
-        """Cluster ServerlessV2 ACU-hours consumed in the window (sum across
-        serverless instances). Provisioned instances contribute fixed hours."""
+    def acu_hours_period(self, instances, start, end):
+        """REAL ACU-hours consumed over the trailing period, integrated from
+        hourly average capacity (avg ACU per bucket * bucket hours). Provisioned
+        instances are reported separately as a fixed cluster cost."""
+        period = self._safe_period_seconds(self._args.period_days)
+        bucket_hours = Decimal(str(period)) / Decimal(3600)
         total_acu_hours = Decimal(0)
         provisioned = []
         for inst in instances:
             iid = inst["DBInstanceIdentifier"]
             if inst["DBInstanceClass"] == "db.serverless":
                 dims = [{"Name": "DBInstanceIdentifier", "Value": iid}]
-                pts = self._metric_avg_latest("ServerlessDatabaseCapacity", dims, start, end)
-                if not pts:
-                    look_start = end - timedelta(hours=self._args.lookback_hours)
-                    pts = self._metric_avg_latest("ServerlessDatabaseCapacity", dims, look_start, end)
-                if pts:
-                    avg_acu = Decimal(str(sum(p["Average"] for p in pts) / len(pts)))
-                    total_acu_hours += avg_acu * (Decimal(str(window_seconds)) / Decimal(3600))
+                pts = self._metric_avg_latest("ServerlessDatabaseCapacity", dims, start, end, period=period)
+                for p in pts:
+                    total_acu_hours += Decimal(str(p["Average"])) * bucket_hours
             else:
                 provisioned.append(inst["DBInstanceClass"])
         return total_acu_hours, provisioned
@@ -410,59 +431,63 @@ class CostAdvisor:
         for i in instances:
             print(f"  instance {i['DBInstanceIdentifier']} ({i['DBInstanceClass']})")
 
-        start = datetime.now(timezone.utc)
+        # Live sample: ONLY used to compute each DB's share of I/O (the split
+        # ratio). Cost magnitudes come from real trailing-period CloudWatch data.
         deltas, window = self.sample_rates()
         sizes = self._database_sizes()
-        end = datetime.now(timezone.utc)
 
         pricing = self.build_pricing()
-
         warnings = []
 
-        # Cluster billed I/O over the sampling window (with lag fallback).
-        billed_window, fell_back, age_min = self.billed_io(
-            start - timedelta(minutes=5), end + timedelta(minutes=5)
-        )
-        if fell_back:
-            age = f"~{age_min:.0f} min old" if age_min is not None else "stale"
+        # --- REAL trailing-period cluster metrics (no 60s extrapolation) -----
+        p_start, p_end, period_hours = self._period_bounds()
+        billed_period, no_billed = self.billed_io_period(p_start, p_end)
+        if no_billed:
             warnings.append(
-                f"Billed I/O: no datapoints in window; used nearest 5-min bucket ({age}). "
-                "Figures approximate -- run against sustained traffic for accuracy."
+                f"No billed I/O datapoints in the last {self._args.period_days}d "
+                "(cluster idle/auto-paused for the whole period). I/O cost shown as $0."
             )
+        acu_hours_period, provisioned = self.acu_hours_period(instances, p_start, p_end)
 
-        # Extrapolate billed I/O to a month.
+        # Normalise the REAL period totals to a canonical 730h month so $/mo is
+        # comparable. With 30d this factor is ~1.014 -- essentially the real total.
         billed_month = {
-            "reads": scale_to_month(billed_window["reads"], window),
-            "writes": scale_to_month(billed_window["writes"], window),
+            "reads": normalize_period_to_month(billed_period["reads"], period_hours),
+            "writes": normalize_period_to_month(billed_period["writes"], period_hours),
         }
+        acu_hours_month = normalize_period_to_month(acu_hours_period, period_hours)
 
-        # Compute/storage context.
-        acu_hours_window, provisioned = self.acu_hours(instances, start, end, window)
-        acu_hours_month = scale_to_month(acu_hours_window, window)
-
-        # Filter to user databases with any activity or size.
+        # Per-DB split ratio from the live sample.
         shares = io_shares(deltas)
         total_io = sum(d["reads"] + d["writes"] for d in deltas.values())
         if total_io == 0:
             warnings.append(
-                "No logical I/O observed -- cluster looks idle. Run against live "
-                "traffic or use a longer --interval."
+                "No logical I/O in the live sample -- cannot split cluster I/O per "
+                "DB. Run against live traffic or use a longer --interval."
             )
 
-        # Part 1: raw per-database I/O attribution (the estimate + evidence).
-        self._attribution_report(deltas, shares, billed_window, fell_back)
+        meta = {
+            "period_days": self._args.period_days,
+            "period_hours": period_hours,
+            "billed_period": billed_period,
+            "window": window,
+        }
+
+        # Part 1: per-database I/O attribution (real cluster totals + live split).
+        self._attribution_report(deltas, shares, billed_period, meta)
         # Part 2: Standard vs I/O-Optimized cost recommendation per database.
         self._report(deltas, shares, sizes, billed_month, acu_hours_month,
-                     pricing, provisioned, window)
+                     pricing, provisioned, meta)
 
         if warnings:
             print("\n--- Warnings ---")
             for w in warnings:
                 print(f"  ! {w}")
 
-    def _attribution_report(self, deltas, shares, billed_window, fell_back):
-        """Per-database I/O attribution: how the cluster's billed I/O splits
-        across logical databases (the foundation the pricing rests on)."""
+    def _attribution_report(self, deltas, shares, billed_period, meta):
+        """Per-database I/O attribution: the cluster's REAL trailing-period
+        billed I/O, split across logical databases by their live activity share
+        (the foundation the pricing rests on)."""
         include_system = self._args.include_system
         dbs = [d for d in deltas if include_system or d not in SYSTEM_DATABASES]
         dbs.sort(key=lambda d: deltas[d]["reads"], reverse=True)
@@ -473,7 +498,7 @@ class CostAdvisor:
         for db in dbs:
             d = deltas[db]
             sh = shares[db]
-            est_billed_reads = Decimal(str(billed_window["reads"])) * sh["read_share"]
+            est_billed_reads = Decimal(str(billed_period["reads"])) * sh["read_share"]
             label = f"{db} (system)" if db in SYSTEM_DATABASES else db
             rows.append([
                 label,
@@ -484,15 +509,17 @@ class CostAdvisor:
                 f"{sh['write_share']*100:.1f}%",
             ])
 
+        pd = meta["period_days"]
         print("\n=== PART 1: PER-DATABASE I/O ATTRIBUTION ===")
+        print(f"(logical reads/writes = live {meta['window']:.0f}s sample; "
+              f"'Est. billed reads' = real {pd}d cluster total x each DB's read share)")
         _print_table(headers, rows)
-        auth = "approximate" if fell_back else "authoritative"
-        print(f"\nCluster billed I/O over window (CloudWatch, {auth}):")
-        print(f"  VolumeReadIOPs   {billed_window['reads']:>14,.0f}")
-        print(f"  VolumeWriteIOPs  {billed_window['writes']:>14,.0f}")
+        print(f"\nCluster billed I/O -- REAL trailing {pd} days (CloudWatch, summed):")
+        print(f"  VolumeReadIOPs   {billed_period['reads']:>16,.0f}")
+        print(f"  VolumeWriteIOPs  {billed_period['writes']:>16,.0f}")
 
     def _report(self, deltas, shares, sizes, billed_month, acu_hours_month,
-                pricing, provisioned, window):
+                pricing, provisioned, meta):
         include_system = self._args.include_system
         dbs = [d for d in deltas
                if include_system or d not in SYSTEM_DATABASES]
@@ -548,10 +575,13 @@ class CostAdvisor:
             print(f"  -> All on Standard: {', '.join(std_dbs)}")
 
         # Compact method / caveat footer: how, what, why -- one line each.
+        pd = meta["period_days"]
         print("\n--- Method ---")
-        print(f"  Window:   {window:.0f}s sample, extrapolated to a 730h month.")
-        print("  What:     billed I/O split per DB by pg_stat_database activity share;")
-        print("            storage by pg_database_size; ServerlessV2 ACU by I/O share.")
+        print(f"  Data:     REAL trailing {pd}-day CloudWatch totals (billed I/O, ACU,")
+        print(f"            storage), normalised to a 730h month. Not 60s-extrapolated.")
+        print(f"  Split:    live {meta['window']:.0f}s pg_stat_database sample gives each")
+        print("            DB's I/O share, applied to the real cluster total.")
+        print("  What:     storage per DB by pg_database_size; ServerlessV2 ACU by I/O share.")
         print("  Why:      I/O-Optimized zeroes per-request I/O charges but raises")
         print("            storage 2.25x and compute 1.33x -> wins only for I/O-heavy DBs.")
         print("  Accuracy: read shares (blks_read) exact; write shares are a row-activity")
@@ -609,8 +639,9 @@ def parse_args():
     p.add_argument("--cluster", help="Cluster identifier for CloudWatch (defaults to name in --cluster-arn)")
     p.add_argument("--connect-db", default="postgres", help="DB to run pg_stat queries against (default: postgres)")
     p.add_argument("--interval", default=60, type=int, help="Seconds between samples (default 60)")
-    p.add_argument("--lookback-hours", default=6, type=int,
-                   help="How far back to search for billed-I/O datapoints when the window is empty (default 6)")
+    p.add_argument("--period-days", default=30, type=int, choices=range(1, 366), metavar="1-365",
+                   help="Trailing period (days) of REAL CloudWatch billed I/O / ACU / storage "
+                        "to use for cost magnitudes (default 30, max 365)")
     p.add_argument("--include-system", action="store_true",
                    help="Include system databases (postgres, template*, rdsadmin) in the table")
     p.add_argument("--profile", help="AWS profile name")

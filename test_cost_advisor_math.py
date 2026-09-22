@@ -60,6 +60,22 @@ def test_scale_to_month():
     assert adv.scale_to_month(100, 0) == 0  # guard
 
 
+def test_normalize_period_to_month():
+    # A REAL 30-day (720h) total is barely rescaled to a 730h month (~1.014x),
+    # i.e. it uses the real data rather than extrapolating.
+    real_30d = Decimal("218374")  # real VolumeReadIOPs total observed
+    m = adv.normalize_period_to_month(real_30d, 720)
+    assert m == real_30d * (Decimal("730") / Decimal("720")), m
+    assert Decimal("1.01") < (m / real_30d) < Decimal("1.02"), m
+    # A 730h period is a no-op (factor exactly 1).
+    assert adv.normalize_period_to_month(Decimal("1000"), 730) == Decimal("1000")
+    # Guard against zero-length period.
+    assert adv.normalize_period_to_month(Decimal("500"), 0) == 0
+    # Contrast with scale_to_month: extrapolating 60s balloons the number,
+    # normalising a real month barely changes it.
+    assert adv.normalize_period_to_month(real_30d, 720) < adv.scale_to_month(real_30d, 60)
+
+
 def test_io_heavy_db_prefers_optimized():
     # A read-heavy DB with huge billed I/O should favour I/O-Optimized:
     # I/O charges dominate and I/O-Optimized zeroes them out.
