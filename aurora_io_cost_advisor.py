@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Aurora PostgreSQL per-database Standard vs I/O-Optimized cost advisor.
+Aurora PostgreSQL per-database I/O attribution + Standard vs I/O-Optimized
+cost advisor. Single tool: every run does BOTH the attribution and the pricing
+analysis in one pass.
 
 What it does
 ------------
@@ -11,18 +13,23 @@ split databases into separate clusters for cost optimisation: park the
 I/O-heavy databases on an I/O-Optimized cluster and keep the low-I/O ones on a
 Standard cluster.
 
-This tool tells you which side of that line each database falls on. It:
+Every run prints two sections:
 
-  1. Samples pg_stat_database (via the RDS Data API) twice to get each logical
-     database's share of physical read + write activity.
-  2. Pulls the cluster's real billed I/O (VolumeReadIOPs / VolumeWriteIOPs) and
-     stored bytes (VolumeBytesUsed) from CloudWatch, and the ServerlessV2
-     capacity (ACU) actually consumed.
-  3. Splits billed I/O across databases by their activity share, extrapolates
-     the sampled window to a monthly rate, and prices each database *as if it
-     were its own cluster* under both Standard and I/O-Optimized.
-  4. Emits a per-database verdict (which mode is cheaper for that DB in
-     isolation) plus the cluster-level total both ways.
+  Part 1 -- Per-database I/O attribution:
+    Samples pg_stat_database (via the RDS Data API) twice to get each logical
+    database's share of physical read + write activity, pulls the cluster's
+    real billed I/O from CloudWatch, and splits that billed I/O across
+    databases by their activity share. This is the evidence the pricing rests
+    on.
+
+  Part 2 -- Standard vs I/O-Optimized cost recommendation:
+    Extrapolates the sampled window to a monthly rate, prices each database
+    *as if it were its own cluster* under both Standard and I/O-Optimized
+    (using live AWS Pricing API data + VolumeBytesUsed + ServerlessV2 ACU),
+    and emits a per-database verdict plus the cluster total both ways and
+    cluster-split guidance.
+
+This tells you which side of the line each database falls on.
 
 Honesty / caveats
 -----------------
@@ -444,8 +451,51 @@ class CostAdvisor:
                 file=sys.stderr,
             )
 
+        # Part 1: raw per-database I/O attribution (the estimate + evidence).
+        self._attribution_report(deltas, shares, billed_window, fell_back)
+        # Part 2: Standard vs I/O-Optimized cost recommendation per database.
         self._report(deltas, shares, sizes, billed_month, acu_hours_month,
                      pricing, provisioned, window)
+
+    def _attribution_report(self, deltas, shares, billed_window, fell_back):
+        """Per-database I/O attribution: how the cluster's billed I/O splits
+        across logical databases (the foundation the pricing rests on)."""
+        include_system = self._args.include_system
+        dbs = [d for d in deltas if include_system or d not in SYSTEM_DATABASES]
+        dbs.sort(key=lambda d: deltas[d]["reads"], reverse=True)
+
+        total_logical_reads = sum(d["reads"] for d in deltas.values()) or 1
+
+        headers = ["Database", "Logical reads", "Read share", "Est. billed reads",
+                   "Logical writes", "Write share"]
+        rows = []
+        for db in dbs:
+            d = deltas[db]
+            sh = shares[db]
+            est_billed_reads = Decimal(str(billed_window["reads"])) * sh["read_share"]
+            label = f"{db} (system)" if db in SYSTEM_DATABASES else db
+            rows.append([
+                label,
+                f"{d['reads']:,}",
+                f"{sh['read_share']*100:.1f}%",
+                f"{est_billed_reads:,.0f}",
+                f"{d['writes']:,}",
+                f"{sh['write_share']*100:.1f}%",
+            ])
+
+        print("\n=== Per-database I/O attribution (estimate) ===")
+        _print_table(headers, rows)
+        auth = " (approximate -- see billed-I/O note above)" if fell_back else ""
+        print(f"\nCluster billed I/O over window (CloudWatch, authoritative{auth}):")
+        print(f"- VolumeReadIOPs (sum):  {billed_window['reads']:,.0f}")
+        print(f"- VolumeWriteIOPs (sum): {billed_window['writes']:,.0f}")
+        print(
+            f"\nSanity check -- logical reads captured across all DBs: "
+            f"{total_logical_reads:,}. The per-DB billed numbers are the cluster "
+            "total split by each DB's share, not measured directly. Read shares "
+            "(blks_read) are reliable; write shares use row activity as a coarse "
+            "proxy (pg_stat_database has no block-level write counter)."
+        )
 
     def _report(self, deltas, shares, sizes, billed_month, acu_hours_month,
                 pricing, provisioned, window):
@@ -482,7 +532,8 @@ class CostAdvisor:
             ])
 
         print(f"\nSampling window: {window:.0f}s (extrapolated to a 730h month)")
-        print("\nPer-database cost comparison (each priced as if alone on a cluster)")
+        print("\n=== Per-database Standard vs I/O-Optimized cost recommendation ===")
+        print("(each database priced as if alone on a cluster)")
         _print_table(headers, rows)
 
         # Cluster-level recommendation.
