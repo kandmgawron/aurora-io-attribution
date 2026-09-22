@@ -1,2 +1,12 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
